@@ -1,0 +1,15 @@
+.venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mplconfig/
+*.pt
+
+# Local calculation products generated during interactive validation.
+bulk_sto_100_5beam/
+bulk_sto_110_5beam/
+sto_azimuth_sanity/
+sto_final_0p01/
+screen_stack_smoke/
+screen_stack_smoke_nhw/
