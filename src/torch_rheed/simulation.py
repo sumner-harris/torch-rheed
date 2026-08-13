@@ -505,6 +505,73 @@ def _trmat(nb: int, gma: torch.Tensor, v: torch.Tensor, vi: torch.Tensor, iv: li
     return result if batched else result[0]
 
 
+def _transfer_to_scattering(
+    transfer: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert a transfer matrix into bounded two-port scattering blocks.
+
+    The returned blocks are ``(r_top, t_up, t_down, r_bottom)``.  Unlike a
+    transfer matrix, these blocks do not carry exponentially growing
+    evanescent amplitudes through subsequent layer compositions.
+    """
+
+    nb2 = transfer.shape[-1]
+    if nb2 % 2 != 0:
+        raise ValueError(f"transfer matrix dimension must be even, got {nb2}")
+    nb = nb2 // 2
+    top_left = transfer[..., :nb, :nb]
+    top_right = transfer[..., :nb, nb:]
+    bottom_left = transfer[..., nb:, :nb]
+    bottom_right = transfer[..., nb:, nb:]
+
+    identity = torch.eye(nb, dtype=transfer.dtype, device=transfer.device)
+    identity = identity.expand(*transfer.shape[:-2], nb, nb)
+    r_top = _right_solve(top_right, bottom_right)
+    t_up = top_left - r_top @ bottom_left
+    t_down = torch.linalg.solve(bottom_right, identity)
+    r_bottom = -(t_down @ bottom_left)
+    return r_top, t_up, t_down, r_bottom
+
+
+def _compose_scattering(
+    upper: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    lower: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compose adjacent two-port scattering matrices with a Redheffer product."""
+
+    r_upper, t_up_upper, t_down_upper, r_bottom_upper = upper
+    r_lower, t_up_lower, t_down_lower, r_bottom_lower = lower
+    nb = r_upper.shape[-1]
+    identity = torch.eye(nb, dtype=r_upper.dtype, device=r_upper.device)
+    identity = identity.expand(*r_upper.shape[:-2], nb, nb)
+
+    lower_denominator = identity - r_lower @ r_bottom_upper
+    upper_denominator = identity - r_bottom_upper @ r_lower
+    lower_to_upper = torch.linalg.solve(lower_denominator, r_lower @ t_down_upper)
+    lower_transmission = torch.linalg.solve(lower_denominator, t_up_lower)
+    upper_transmission = torch.linalg.solve(upper_denominator, t_down_upper)
+
+    r_top = r_upper + t_up_upper @ lower_to_upper
+    t_up = t_up_upper @ lower_transmission
+    t_down = t_down_lower @ upper_transmission
+    r_bottom = r_bottom_lower + t_down_lower @ r_bottom_upper @ lower_transmission
+    return r_top, t_up, t_down, r_bottom
+
+
+def _terminate_scattering(
+    scattering: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    lower_reflection: torch.Tensor,
+) -> torch.Tensor:
+    """Return the reflection seen above a scattering region and lower load."""
+
+    r_top, t_up, t_down, r_bottom = scattering
+    nb = r_top.shape[-1]
+    identity = torch.eye(nb, dtype=r_top.dtype, device=r_top.device)
+    identity = identity.expand(*r_top.shape[:-2], nb, nb)
+    internal = torch.linalg.solve(identity - r_bottom @ lower_reflection, t_down)
+    return r_top + t_up @ lower_reflection @ internal
+
+
 def _simulate_bulk_domain(
     bulk_input: BulkInput,
     *,
@@ -665,31 +732,34 @@ def _simulate_bulk_domain(
         sval = wn * wn - (ghx * ih_group + wnx).square() - (ghy * ih_group + gky * ik_group + wny).square()
         gma = _complex_sqrt_from_sval(sval)
 
-        transfer_product: torch.Tensor | None = None
+        cell_scattering: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         for layer in range(ns):
             transfer = _trmat(nbf, gma, v[:, layer], vi[:, layer], iv, dz)
-            transfer_product = transfer if transfer_product is None else transfer @ transfer_product
+            layer_scattering = _transfer_to_scattering(transfer)
+            cell_scattering = (
+                layer_scattering
+                if cell_scattering is None
+                else _compose_scattering(layer_scattering, cell_scattering)
+            )
 
-        if transfer_product is None:
-            raise RuntimeError("bulk transfer product was not initialized")
+        if cell_scattering is None:
+            raise RuntimeError("bulk scattering composition was not initialized")
 
         if ph_tensor is not None:
             factor = ph_tensor.index_select(0, indices)
-            transfer_product[:, :, :nbf] = transfer_product[:, :, :nbf] * factor.view(1, 1, -1)
-            transfer_product[:, :, nbf:] = transfer_product[:, :, nbf:] * factor.view(1, 1, -1)
+            inverse_factor = 1.0 / factor
+            r_top, t_up, t_down, r_bottom = cell_scattering
+            t_up = t_up * factor.view(1, 1, -1)
+            t_down = inverse_factor.view(1, -1, 1) * t_down
+            r_bottom = inverse_factor.view(1, -1, 1) * r_bottom * factor.view(1, 1, -1)
+            cell_scattering = r_top, t_up, t_down, r_bottom
 
-        top_left = transfer_product[:, :nbf, :nbf]
-        top_right = transfer_product[:, :nbf, nbf:]
-        bottom_left = transfer_product[:, nbf:, :nbf]
-        bottom_right = transfer_product[:, nbf:, nbf:]
         r20 = torch.zeros((n_angles, nbf), dtype=torch.float64, device=device)
         active = torch.ones((n_angles,), dtype=torch.bool, device=device)
         t4_block = torch.zeros((n_angles, nbf, nbf), dtype=torch.complex128, device=device)
 
         for layer_count in range(1, bulk_input.ml + 1):
-            t1 = top_right if layer_count == 1 else top_right + top_left @ t4_block
-            t2 = bottom_right if layer_count == 1 else bottom_right + bottom_left @ t4_block
-            new_block = _right_solve(t1, t2)
+            new_block = _terminate_scattering(cell_scattering, t4_block)
 
             if layer_count < 20:
                 t4_block = new_block
@@ -1072,13 +1142,6 @@ def simulate_rocking_curve_batch(
 
     f = _assemble_initial_reflection_batch(domain, n_angles).unsqueeze(0).expand(n_structures, -1, -1, -1).clone()
     gma_batch = gma.unsqueeze(0).expand(n_structures, -1, -1)
-    identity = torch.eye(domain.nb + domain.nb, dtype=torch.complex128, device=bulk.device).view(
-        1,
-        1,
-        domain.nb + domain.nb,
-        domain.nb + domain.nb,
-    )
-
     for layer in range(max_ns):
         v_flat = v_batch[:, :, layer].unsqueeze(1).expand(-1, n_angles, -1).reshape(-1, nv)
         vi_flat = vi_batch[:, :, layer].unsqueeze(1).expand(-1, n_angles, -1).reshape(-1, nv)
@@ -1089,11 +1152,14 @@ def simulate_rocking_curve_batch(
             vi_flat,
             iv,
             bulk.dz,
-        ).reshape(n_structures, n_angles, domain.nb + domain.nb, domain.nb + domain.nb)
-        transfer = torch.where(active_layers[:, layer].view(-1, 1, 1, 1), transfer, identity)
-        t2 = transfer[:, :, : domain.nb, domain.nb :] + transfer[:, :, : domain.nb, : domain.nb] @ f
-        t3 = transfer[:, :, domain.nb :, domain.nb :] + transfer[:, :, domain.nb :, : domain.nb] @ f
-        f = _right_solve(t2, t3)
+        )
+        scattering_flat = _transfer_to_scattering(transfer)
+        scattering = tuple(
+            block.reshape(n_structures, n_angles, domain.nb, domain.nb)
+            for block in scattering_flat
+        )
+        new_f = _terminate_scattering(scattering, f)
+        f = torch.where(active_layers[:, layer].view(-1, 1, 1, 1), new_f, f)
 
     sval_real = gma.real.unsqueeze(0)
     amp2 = torch.abs(f[:, :, :, nb0]).square()
