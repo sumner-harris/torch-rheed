@@ -25,6 +25,38 @@ from .screen import DEFAULT_SCREEN_IMAGE_CONFIG, render_screen_stack
 torch.set_default_dtype(torch.float64)
 
 
+SURFACE_SOLVERS = ("sp6", "multislice")
+
+# Sixth-order, 11-stage symmetric BAB splitting method SRKN^b_11 from
+# Blanes and Moan (2002), as used by Kudo, Yamamoto, and Hoshi (2024).
+_SP6_BAB = (
+    0.0414649985182624,
+    0.123229775946271,
+    0.198128671918067,
+    0.290553797799558,
+    -0.0400061921041533,
+    -0.127049212625417,
+    0.0752539843015807,
+    -0.246331761062075,
+    -0.0115113874206879,
+    0.357208872795928,
+    0.2366699247869311,
+    0.20477705429147,
+    0.2366699247869311,
+    0.357208872795928,
+    -0.0115113874206879,
+    -0.246331761062075,
+    0.0752539843015807,
+    -0.127049212625417,
+    -0.0400061921041533,
+    0.290553797799558,
+    0.198128671918067,
+    0.123229775946271,
+    0.0414649985182624,
+)
+_SP6_STAGES = 11
+
+
 def _resolve_device(device: str | torch.device | None) -> torch.device:
     """Normalize the requested execution device for solver entrypoints."""
 
@@ -298,6 +330,7 @@ def _scpot(
     *,
     negpos: int = -1,
     iclr: int = 1,
+    sample_z: torch.Tensor | None = None,
 ) -> None:
     """Accumulate the scattering potential for one layer stack."""
 
@@ -330,7 +363,12 @@ def _scpot(
     gr = gh[:nv_use].unsqueeze(1) * (dx + xb).unsqueeze(0) + gk[:nv_use].unsqueeze(1) * (dy + yb).unsqueeze(0)
     st = torch.complex(torch.cos(gr), torch.sin(gr))
 
-    layer_z = dz * 0.5 + zo + dz * torch.arange(ns, dtype=torch.float64, device=device)
+    if sample_z is None:
+        layer_z = dz * 0.5 + zo + dz * torch.arange(ns, dtype=torch.float64, device=device)
+    else:
+        if sample_z.ndim != 1 or sample_z.numel() != ns:
+            raise ValueError(f"sample_z must contain exactly ns={ns} positions")
+        layer_z = sample_z.to(dtype=torch.float64, device=device) + zo
     z2 = (layer_z.unsqueeze(1) - atom_z.unsqueeze(0)).square()
     positive_sap = torch.clamp(sap_tensor[atom_ielm], min=0.0)
     abs_sap = torch.abs(sap_tensor[atom_ielm])
@@ -570,6 +608,178 @@ def _terminate_scattering(
     identity = identity.expand(*r_top.shape[:-2], nb, nb)
     internal = torch.linalg.solve(identity - r_bottom @ lower_reflection, t_down)
     return r_top + t_up @ lower_reflection @ internal
+
+
+def _normalize_surface_solver(solver: str) -> str:
+    normalized = solver.lower().strip()
+    if normalized not in SURFACE_SOLVERS:
+        choices = ", ".join(SURFACE_SOLVERS)
+        raise ValueError(f"unknown surface solver {solver!r}; expected one of: {choices}")
+    return normalized
+
+
+def _surface_domain_length(bulk: BulkSimulation, surface: SurfaceInput) -> float:
+    """Return the legacy surface integration extent without moving its boundary."""
+
+    if surface.nsgs < 1:
+        return 0.0
+    if surface.natms > 0:
+        requested_extent = max(surface.z) + surface.dthick + bulk.source.cc
+    else:
+        requested_extent = surface.dthick + bulk.source.cc
+    legacy_slices = int(requested_extent / bulk.dz) + 1
+    return legacy_slices * bulk.dz
+
+
+def _sp6_sample_grid(
+    bulk: BulkSimulation,
+    surface: SurfaceInput,
+    requested_step: float,
+) -> tuple[torch.Tensor, int, float]:
+    """Build all potential-evaluation nodes for the SRKN^b_11 BAB scheme."""
+
+    if requested_step <= 0.0:
+        raise ValueError("SP6 integration_step must be positive")
+    extent = _surface_domain_length(bulk, surface)
+    if extent == 0.0:
+        return torch.empty(0, dtype=torch.float64, device=bulk.device), 0, requested_step
+
+    step_count = max(1, int(math.floor(extent / requested_step + 0.5)))
+    step_size = extent / step_count
+    a_coefficients = torch.tensor(_SP6_BAB[1::2], dtype=torch.float64, device=bulk.device)
+    stage_offsets = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.float64, device=bulk.device),
+            torch.cumsum(a_coefficients[:-1], dim=0),
+        )
+    )
+    step_starts = torch.arange(step_count, dtype=torch.float64, device=bulk.device) * step_size
+    sample_z = (step_starts[:, None] + step_size * stage_offsets[None, :]).reshape(-1)
+    sample_z = torch.cat((sample_z, torch.tensor([extent], dtype=torch.float64, device=bulk.device)))
+    return sample_z, step_count, step_size
+
+
+def _potential_hermitian(
+    nb: int,
+    v: torch.Tensor,
+    vi: torch.Tensor,
+    iv: list[list[int]],
+) -> torch.Tensor:
+    """Assemble U(z)^H for every leading batch/sample dimension."""
+
+    result = torch.zeros((*v.shape[:-1], nb, nb), dtype=torch.complex128, device=v.device)
+    diagonal = torch.arange(nb, device=v.device)
+    result[..., diagonal, diagonal] = torch.conj(v[..., 0] + vi[..., 0]).unsqueeze(-1)
+
+    if nb > 1:
+        upper_rows: list[int] = []
+        upper_cols: list[int] = []
+        indices: list[int] = []
+        for row in range(nb):
+            for col in range(row + 1, nb):
+                upper_rows.append(row)
+                upper_cols.append(col)
+                indices.append(iv[col][row])
+        rows = torch.tensor(upper_rows, dtype=torch.long, device=v.device)
+        cols = torch.tensor(upper_cols, dtype=torch.long, device=v.device)
+        gather = torch.tensor(indices, dtype=torch.long, device=v.device)
+        result[..., rows, cols] = torch.conj(v.index_select(-1, gather) + vi.index_select(-1, gather))
+        result[..., cols, rows] = v.index_select(-1, gather) - vi.index_select(-1, gather)
+    return result
+
+
+def _gershgorin_condition_estimate(matrix: torch.Tensor) -> torch.Tensor:
+    """Estimate the condition number with the paper's Gershgorin bound."""
+
+    magnitudes = matrix.abs()
+    diagonal = magnitudes.diagonal(dim1=-2, dim2=-1)
+    radii = magnitudes.sum(dim=-2) - diagonal
+    lower = (diagonal - radii).amin(dim=-1)
+    upper = (diagonal + radii).amax(dim=-1)
+    return torch.where(lower > 0.0, upper / lower, torch.full_like(lower, float("inf")))
+
+
+def _rhst_normalize(
+    q: torch.Tensor,
+    p: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply [Q, P] <- [I, Q^-1 P] for selected batched states."""
+
+    selected = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
+    if selected.numel() == 0:
+        return q, p
+
+    nb = q.shape[-1]
+    q_flat = q.reshape(-1, nb, nb)
+    p_flat = p.reshape(-1, nb, nb)
+    normalized_p = torch.linalg.solve(q_flat.index_select(0, selected), p_flat.index_select(0, selected))
+    p_flat = p_flat.clone()
+    q_flat = q_flat.clone()
+    p_flat[selected] = normalized_p
+    identity = torch.eye(nb, dtype=q.dtype, device=q.device).expand(selected.numel(), -1, -1)
+    q_flat[selected] = identity
+    return q_flat.reshape_as(q), p_flat.reshape_as(p)
+
+
+def _integrate_sp6_reflection(
+    initial_reflection: torch.Tensor,
+    gma: torch.Tensor,
+    potential_h: torch.Tensor,
+    step_counts: torch.Tensor,
+    step_sizes: torch.Tensor,
+    *,
+    rhst_threshold: float,
+) -> torch.Tensor:
+    """Propagate surface reflection matrices with sixth-order BAB splitting."""
+
+    if rhst_threshold <= 1.0:
+        raise ValueError("rhst_threshold must be greater than 1")
+    n_structures, n_angles, nb, _ = initial_reflection.shape
+    max_steps = int(step_counts.max().item())
+    if max_steps == 0:
+        return initial_reflection
+    if potential_h.shape[:2] != (n_structures, max_steps * _SP6_STAGES + 1):
+        raise ValueError("potential_h does not match the requested SP6 step grid")
+
+    identity = torch.eye(nb, dtype=torch.complex128, device=initial_reflection.device)
+    identity_batch = identity.expand(n_structures, n_angles, -1, -1)
+    reflection_h = initial_reflection.conj().transpose(-2, -1)
+    p = torch.linalg.solve(identity_batch + reflection_h, identity_batch - reflection_h)
+    p = (1j * torch.conj(gma).unsqueeze(-1)) * p
+    q = identity_batch.clone()
+
+    b_coefficients = _SP6_BAB[0::2]
+    a_coefficients = _SP6_BAB[1::2]
+    h = step_sizes.view(n_structures, 1, 1, 1)
+    gma_squared_h = torch.conj(gma.square()).unsqueeze(-2)
+
+    for step in range(max_steps):
+        active_structure = step < step_counts
+        active = active_structure.view(n_structures, 1, 1, 1)
+        for stage, (cb, ca) in enumerate(zip(b_coefficients[:-1], a_coefficients, strict=True)):
+            u_h = potential_h[:, step * _SP6_STAGES + stage].unsqueeze(1)
+            force = q @ u_h + q * gma_squared_h
+            next_p = p - (cb * h) * force
+            next_q = q + (ca * h) * next_p
+            p = torch.where(active, next_p, p)
+            q = torch.where(active, next_q, q)
+
+        endpoint_h = potential_h[:, step * _SP6_STAGES + _SP6_STAGES].unsqueeze(1)
+        endpoint_force = q @ endpoint_h + q * gma_squared_h
+        next_p = p - (b_coefficients[-1] * h) * endpoint_force
+        p = torch.where(active, next_p, p)
+
+        condition = _gershgorin_condition_estimate(q)
+        final_step = (step + 1 == step_counts).view(n_structures, 1)
+        normalize = active_structure.view(n_structures, 1) & ((condition > rhst_threshold) | final_step)
+        q, p = _rhst_normalize(q, p, normalize)
+
+    gamma_h = torch.diag_embed(torch.conj(gma))
+    denominator = gamma_h - 1j * p
+    numerator = gamma_h + 1j * p
+    reflection_h = torch.linalg.solve(denominator, numerator)
+    return reflection_h.conj().transpose(-2, -1).contiguous()
 
 
 def _simulate_bulk_domain(
@@ -839,6 +1049,7 @@ def _build_surface_potential(
     gky: float,
     gh: torch.Tensor,
     gk: torch.Tensor,
+    sample_z: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Assemble the surface-side scattering potential for one structure."""
 
@@ -863,6 +1074,8 @@ def _build_surface_potential(
 
     if surface.nsgs < 1:
         ns = 0
+    elif sample_z is not None:
+        ns = sample_z.numel()
     elif surface.natms > 0:
         ns = int((max(surface.z) + surface.dthick + bulk.source.cc) / bulk.dz) + 1
     else:
@@ -897,6 +1110,7 @@ def _build_surface_potential(
         v=v,
         vi=vi,
         iclr=1,
+        sample_z=sample_z,
     )
     _scpot(
         nv_use=domain.nvb,
@@ -923,6 +1137,7 @@ def _build_surface_potential(
         v=v,
         vi=vi,
         iclr=0,
+        sample_z=sample_z,
     )
     _scpot(
         nv_use=domain.nvb,
@@ -949,6 +1164,7 @@ def _build_surface_potential(
         v=v,
         vi=vi,
         iclr=-1,
+        sample_z=sample_z,
     )
     return v, vi, ns
 
@@ -1057,10 +1273,20 @@ def simulate_rocking_curve(
     surface: SurfaceInput,
     *,
     screen_config: ScreenImageConfig | None = DEFAULT_SCREEN_IMAGE_CONFIG,
+    solver: str = "sp6",
+    integration_step: float | None = None,
+    rhst_threshold: float = 1_000.0,
 ) -> RockingCurveResult:
     """Run the surface rocking-curve solver and detector-image renderer for one structure."""
 
-    return simulate_rocking_curve_batch(bulk, [surface], screen_config=screen_config).get_result(0)
+    return simulate_rocking_curve_batch(
+        bulk,
+        [surface],
+        screen_config=screen_config,
+        solver=solver,
+        integration_step=integration_step,
+        rhst_threshold=rhst_threshold,
+    ).get_result(0)
 
 
 def simulate_rocking_curve_batch(
@@ -1068,6 +1294,9 @@ def simulate_rocking_curve_batch(
     surfaces: list[SurfaceInput],
     *,
     screen_config: ScreenImageConfig | None = DEFAULT_SCREEN_IMAGE_CONFIG,
+    solver: str = "sp6",
+    integration_step: float | None = None,
+    rhst_threshold: float = 1_000.0,
 ) -> RockingCurveBatchResult:
     """Run a batched rocking-curve solve and detector-image render for compatible structures."""
 
@@ -1075,6 +1304,9 @@ def simulate_rocking_curve_batch(
         raise NotImplementedError("torch_rheed currently supports only single-domain inputs")
     if not surfaces:
         raise ValueError("at least one surface structure is required for batched simulation")
+    solver = _normalize_surface_solver(solver)
+    if solver == "multislice" and integration_step is not None:
+        raise ValueError("integration_step is only used by the SP6 surface solver")
 
     domain = bulk.domains[0]
     for surface in surfaces:
@@ -1102,37 +1334,6 @@ def simulate_rocking_curve_batch(
     n_angles = angle_tensor.numel()
     n_structures = len(surfaces)
 
-    potentials: list[torch.Tensor] = []
-    imaginary_potentials: list[torch.Tensor] = []
-    layer_counts: list[int] = []
-    for surface in surfaces:
-        v, vi, ns = _build_surface_potential(
-            bulk,
-            surface,
-            domain,
-            nv=nv,
-            igh=igh,
-            igk=igk,
-            ghx=ghx,
-            ghy=ghy,
-            gky=gky,
-            gh=gh,
-            gk=gk,
-        )
-        potentials.append(v)
-        imaginary_potentials.append(vi)
-        layer_counts.append(ns)
-
-    max_ns = max(layer_counts)
-    v_batch = torch.zeros((n_structures, nv, max_ns), dtype=torch.complex128, device=bulk.device)
-    vi_batch = torch.zeros((n_structures, nv, max_ns), dtype=torch.complex128, device=bulk.device)
-    active_layers = torch.zeros((n_structures, max_ns), dtype=torch.bool, device=bulk.device)
-    for index, (v, vi, ns) in enumerate(zip(potentials, imaginary_potentials, layer_counts)):
-        if ns > 0:
-            v_batch[index, :, :ns] = v
-            vi_batch[index, :, :ns] = vi
-            active_layers[index, :ns] = True
-
     ih_tensor = torch.tensor(domain.ih, dtype=torch.float64, device=bulk.device).unsqueeze(0)
     ik_tensor = torch.tensor(domain.ik, dtype=torch.float64, device=bulk.device).unsqueeze(0)
     wnx = wave_xy[:, 0].unsqueeze(1)
@@ -1142,24 +1343,100 @@ def simulate_rocking_curve_batch(
 
     f = _assemble_initial_reflection_batch(domain, n_angles).unsqueeze(0).expand(n_structures, -1, -1, -1).clone()
     gma_batch = gma.unsqueeze(0).expand(n_structures, -1, -1)
-    for layer in range(max_ns):
-        v_flat = v_batch[:, :, layer].unsqueeze(1).expand(-1, n_angles, -1).reshape(-1, nv)
-        vi_flat = vi_batch[:, :, layer].unsqueeze(1).expand(-1, n_angles, -1).reshape(-1, nv)
-        transfer = _trmat(
-            domain.nb,
-            gma_batch.reshape(-1, domain.nb),
-            v_flat,
-            vi_flat,
-            iv,
-            bulk.dz,
+    if solver == "multislice":
+        potentials: list[torch.Tensor] = []
+        imaginary_potentials: list[torch.Tensor] = []
+        layer_counts: list[int] = []
+        for surface in surfaces:
+            v, vi, ns = _build_surface_potential(
+                bulk,
+                surface,
+                domain,
+                nv=nv,
+                igh=igh,
+                igk=igk,
+                ghx=ghx,
+                ghy=ghy,
+                gky=gky,
+                gh=gh,
+                gk=gk,
+            )
+            potentials.append(v)
+            imaginary_potentials.append(vi)
+            layer_counts.append(ns)
+
+        max_ns = max(layer_counts)
+        v_batch = torch.zeros((n_structures, nv, max_ns), dtype=torch.complex128, device=bulk.device)
+        vi_batch = torch.zeros((n_structures, nv, max_ns), dtype=torch.complex128, device=bulk.device)
+        active_layers = torch.zeros((n_structures, max_ns), dtype=torch.bool, device=bulk.device)
+        for index, (v, vi, ns) in enumerate(zip(potentials, imaginary_potentials, layer_counts)):
+            if ns > 0:
+                v_batch[index, :, :ns] = v
+                vi_batch[index, :, :ns] = vi
+                active_layers[index, :ns] = True
+
+        for layer in range(max_ns):
+            v_flat = v_batch[:, :, layer].unsqueeze(1).expand(-1, n_angles, -1).reshape(-1, nv)
+            vi_flat = vi_batch[:, :, layer].unsqueeze(1).expand(-1, n_angles, -1).reshape(-1, nv)
+            transfer = _trmat(
+                domain.nb,
+                gma_batch.reshape(-1, domain.nb),
+                v_flat,
+                vi_flat,
+                iv,
+                bulk.dz,
+            )
+            scattering_flat = _transfer_to_scattering(transfer)
+            scattering = tuple(
+                block.reshape(n_structures, n_angles, domain.nb, domain.nb)
+                for block in scattering_flat
+            )
+            new_f = _terminate_scattering(scattering, f)
+            f = torch.where(active_layers[:, layer].view(-1, 1, 1, 1), new_f, f)
+    else:
+        requested_step = integration_step if integration_step is not None else 10.0 * bulk.dz
+        potential_matrices: list[torch.Tensor] = []
+        step_counts_list: list[int] = []
+        step_sizes_list: list[float] = []
+        for surface in surfaces:
+            sample_z, step_count, step_size = _sp6_sample_grid(bulk, surface, requested_step)
+            v, vi, _ = _build_surface_potential(
+                bulk,
+                surface,
+                domain,
+                nv=nv,
+                igh=igh,
+                igk=igk,
+                ghx=ghx,
+                ghy=ghy,
+                gky=gky,
+                gh=gh,
+                gk=gk,
+                sample_z=sample_z,
+            )
+            potential_matrices.append(
+                _potential_hermitian(domain.nb, v.transpose(0, 1), vi.transpose(0, 1), iv)
+            )
+            step_counts_list.append(step_count)
+            step_sizes_list.append(step_size)
+
+        max_steps = max(step_counts_list)
+        potential_h = torch.zeros(
+            (n_structures, max_steps * _SP6_STAGES + 1, domain.nb, domain.nb),
+            dtype=torch.complex128,
+            device=bulk.device,
         )
-        scattering_flat = _transfer_to_scattering(transfer)
-        scattering = tuple(
-            block.reshape(n_structures, n_angles, domain.nb, domain.nb)
-            for block in scattering_flat
+        for index, matrix_samples in enumerate(potential_matrices):
+            if matrix_samples.shape[0] > 0:
+                potential_h[index, : matrix_samples.shape[0]] = matrix_samples
+        f = _integrate_sp6_reflection(
+            f,
+            gma_batch,
+            potential_h,
+            torch.tensor(step_counts_list, dtype=torch.long, device=bulk.device),
+            torch.tensor(step_sizes_list, dtype=torch.float64, device=bulk.device),
+            rhst_threshold=rhst_threshold,
         )
-        new_f = _terminate_scattering(scattering, f)
-        f = torch.where(active_layers[:, layer].view(-1, 1, 1, 1), new_f, f)
 
     sval_real = gma.real.unsqueeze(0)
     amp2 = torch.abs(f[:, :, :, nb0]).square()
@@ -1197,13 +1474,23 @@ def simulate_from_files(
     *,
     device: str | torch.device | None = None,
     screen_config: ScreenImageConfig | None = DEFAULT_SCREEN_IMAGE_CONFIG,
+    solver: str = "sp6",
+    integration_step: float | None = None,
+    rhst_threshold: float = 1_000.0,
 ) -> RockingCurveResult:
     """Run a complete standalone simulation from `bulk.txt` and `surf.txt`."""
 
     bulk_input = load_bulk_input(bulk_path)
     surface_input = load_surface_input(surface_path, bulk_input.ndom)
     bulk = simulate_bulk(bulk_input, device=device)
-    return simulate_rocking_curve(bulk, surface_input, screen_config=screen_config)
+    return simulate_rocking_curve(
+        bulk,
+        surface_input,
+        screen_config=screen_config,
+        solver=solver,
+        integration_step=integration_step,
+        rhst_threshold=rhst_threshold,
+    )
 
 
 def simulate_from_files_batch(
@@ -1212,6 +1499,9 @@ def simulate_from_files_batch(
     *,
     device: str | torch.device | None = None,
     screen_config: ScreenImageConfig | None = DEFAULT_SCREEN_IMAGE_CONFIG,
+    solver: str = "sp6",
+    integration_step: float | None = None,
+    rhst_threshold: float = 1_000.0,
 ) -> RockingCurveBatchResult:
     """Run the optimized shared-bulk batch path for multiple surface files."""
 
@@ -1220,7 +1510,14 @@ def simulate_from_files_batch(
     bulk_input = load_bulk_input(bulk_path)
     bulk = simulate_bulk(bulk_input, device=device)
     surfaces = [load_surface_input(path, bulk_input.ndom) for path in surface_paths]
-    return simulate_rocking_curve_batch(bulk, surfaces, screen_config=screen_config)
+    return simulate_rocking_curve_batch(
+        bulk,
+        surfaces,
+        screen_config=screen_config,
+        solver=solver,
+        integration_step=integration_step,
+        rhst_threshold=rhst_threshold,
+    )
 
 
 def simulate_pairs_batch(
@@ -1228,6 +1525,9 @@ def simulate_pairs_batch(
     *,
     device: str | torch.device | None = None,
     screen_config: ScreenImageConfig | None = DEFAULT_SCREEN_IMAGE_CONFIG,
+    solver: str = "sp6",
+    integration_step: float | None = None,
+    rhst_threshold: float = 1_000.0,
 ) -> RockingCurvePairBatchResult:
     """Run a high-level batch of ``(bulk.txt, surf.txt)`` pairs.
 
@@ -1276,6 +1576,9 @@ def simulate_pairs_batch(
                 bulk,
                 surfaces[0],
                 screen_config=screen_config,
+                solver=solver,
+                integration_step=integration_step,
+                rhst_threshold=rhst_threshold,
             )
             continue
 
@@ -1283,6 +1586,9 @@ def simulate_pairs_batch(
             bulk,
             surfaces,
             screen_config=screen_config,
+            solver=solver,
+            integration_step=integration_step,
+            rhst_threshold=rhst_threshold,
         )
         for local_index, item in enumerate(group_items):
             ordered_results[item[0]] = batch_result.get_result(local_index)

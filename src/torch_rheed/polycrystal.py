@@ -370,6 +370,9 @@ def simulate_polycrystal_from_bulk(
     beam_shell_radius: int = 4,
     device: str | torch.device | None = None,
     screen_config: ScreenImageConfig = ScreenImageConfig(frame_azimuth_deg=0.0),
+    solver: str = "sp6",
+    integration_step: float | None = None,
+    rhst_threshold: float = 1_000.0,
 ) -> PolycrystalResult:
     """Generate many cubic grain orientations, simulate them, and integrate the detector stack."""
 
@@ -389,7 +392,14 @@ def simulate_polycrystal_from_bulk(
     failed_orientations: list[PolycrystalOrientation] = []
     for orientation, input_pair in zip(orientations, input_pairs, strict=True):
         try:
-            pair_result = simulate_pairs_batch([input_pair], device=device, screen_config=screen_config)
+            pair_result = simulate_pairs_batch(
+                [input_pair],
+                device=device,
+                screen_config=screen_config,
+                solver=solver,
+                integration_step=integration_step,
+                rhst_threshold=rhst_threshold,
+            )
         except RuntimeError:
             failed_orientations.append(orientation)
             continue

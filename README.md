@@ -42,6 +42,43 @@ torch-rheed simulate `
   --out-dir C:\path\to\results
 ```
 
+Use the sixth-order SP6 surface solver from Kudo, Yamamoto, and Hoshi with:
+
+```powershell
+torch-rheed simulate `
+  --bulk C:\path\to\bulk.txt `
+  --surf C:\path\to\surf.txt `
+  --solver sp6 `
+  --integration-step 0.2 `
+  --device cpu `
+  --out-dir C:\path\to\results_sp6
+```
+
+`--integration-step` is the requested surface integration step in Angstrom.
+The solver adjusts it slightly so that the existing integration boundary is
+covered exactly. If it is omitted, SP6 requests ten times the effective `DZ`
+from `bulk.txt`. SP6 is the default surface solver. The original
+eigendecomposition-based solver remains available with `--solver multislice`.
+
+SP6 implements the paper's sixth-order, 11-stage symmetric `SRKN^b_11` BAB
+splitting and the right-hand-side transformation (RHST). The RHST threshold
+defaults to `1000`, matching the paper and original Fortran implementation;
+it can be changed with `--rhst-threshold` for numerical experiments.
+
+Implementation references:
+
+- Kudo, Yamamoto, and Hoshi, *Computer Physics Communications* 296 (2024),
+  [doi:10.1016/j.cpc.2023.109029](https://doi.org/10.1016/j.cpc.2023.109029)
+- Original Fortran [`surf_prkn.f90`](https://github.com/shuheikudo/trhepd-opt/blob/main/sim-trhepd-rheed/src/surf_prkn.f90)
+  and [`matcomp.f90`](https://github.com/shuheikudo/trhepd-opt/blob/main/sim-trhepd-rheed/src/matcomp.f90)
+
+For a new material or beam set, verify convergence by repeating the SP6 run
+with half the integration step. A representative 19-beam, 691-angle SrTiO3
+case in this repository took 3.1 s at `0.2` Angstrom versus 89.1 s for the
+legacy surface solve on the same CPU (28.6x faster); the maximum intensity
+change between SP6 steps `0.2` and `0.05` Angstrom was below 5e-6 of the peak
+intensity. Performance varies with beam count, angle count, device, and input.
+
 With `--out-dir`, `simulate` also writes:
 
 - `screen_stack.pt`: raw screen tensor shaped `(N, H, W)` for one structure
@@ -164,6 +201,15 @@ result.write_csv(Path(r"C:\path\to\rocking_curve.csv"))
 result.write_screen_stack(Path(r"C:\path\to\screen_stack.pt"))
 plot_rocking_curve(result, Path(r"C:\path\to\rocking_curve.png"))
 plot_screen_frame(result, Path(r"C:\path\to\screen_preview.png"))
+
+sp6_result = simulate_from_files(
+    Path(r"C:\path\to\bulk.txt"),
+    Path(r"C:\path\to\surf.txt"),
+    device="cpu",
+    screen_config=None,
+    solver="sp6",
+    integration_step=0.2,
+)
 
 batch = simulate_from_files_batch(
     Path(r"C:\path\to\bulk.txt"),

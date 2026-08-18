@@ -156,6 +156,23 @@ def _add_common_simulation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bulk", required=True, type=Path, help="Path to the bulk.txt input file.")
     parser.add_argument("--surf", required=True, type=Path, help="Path to the surf.txt input file.")
     parser.add_argument(
+        "--solver",
+        choices=("multislice", "sp6"),
+        default="sp6",
+        help="Surface propagator. Defaults to the sixth-order SP6 SRKN^b_11 splitting method with RHST.",
+    )
+    parser.add_argument(
+        "--integration-step",
+        type=float,
+        help="Requested SP6 surface step in Angstrom. Defaults to 10 times the bulk.txt DZ.",
+    )
+    parser.add_argument(
+        "--rhst-threshold",
+        type=float,
+        default=1000.0,
+        help="Gershgorin condition estimate that triggers SP6 right-hand-side stabilization.",
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         help="Torch execution device, for example 'cpu', 'cuda', or 'cuda:0'. Defaults to 'cpu'.",
@@ -272,7 +289,15 @@ def _screen_config_from_args(args: argparse.Namespace) -> ScreenImageConfig:
 
 
 def _command_simulate(args: argparse.Namespace) -> int:
-    result = simulate_from_files(args.bulk, args.surf, device=args.device, screen_config=_screen_config_from_args(args))
+    result = simulate_from_files(
+        args.bulk,
+        args.surf,
+        device=args.device,
+        screen_config=_screen_config_from_args(args),
+        solver=args.solver,
+        integration_step=args.integration_step,
+        rhst_threshold=args.rhst_threshold,
+    )
     surface_output, csv_output, plot_output = _resolve_outputs(
         args.out_dir,
         args.surface_output,
@@ -321,7 +346,15 @@ def _command_plot(args: argparse.Namespace) -> int:
 
 
 def _command_validate(args: argparse.Namespace) -> int:
-    result = simulate_from_files(args.bulk, args.surf, device=args.device, screen_config=_screen_config_from_args(args))
+    result = simulate_from_files(
+        args.bulk,
+        args.surf,
+        device=args.device,
+        screen_config=_screen_config_from_args(args),
+        solver=args.solver,
+        integration_step=args.integration_step,
+        rhst_threshold=args.rhst_threshold,
+    )
     surface_output, csv_output, plot_output = _resolve_outputs(
         args.out_dir,
         args.surface_output,
@@ -470,6 +503,9 @@ def _command_polycrystal(args: argparse.Namespace) -> int:
         beam_shell_radius=args.beam_shell_radius,
         device=args.device,
         screen_config=_screen_config_from_args(args),
+        solver=args.solver,
+        integration_step=args.integration_step,
+        rhst_threshold=args.rhst_threshold,
     )
 
     (
@@ -688,6 +724,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for generated orientation inputs and integrated detector outputs.",
     )
     poly_parser.add_argument("--device", default="cpu", help="Torch execution device, for example 'cpu' or 'cuda:0'.")
+    poly_parser.add_argument("--solver", choices=("multislice", "sp6"), default="sp6", help="Surface propagator used for each grain orientation (default: sp6).")
+    poly_parser.add_argument("--integration-step", type=float, help="Requested SP6 surface step in Angstrom.")
+    poly_parser.add_argument("--rhst-threshold", type=float, default=1000.0, help="SP6 RHST condition threshold.")
     poly_parser.add_argument("--max-miller-index", type=int, default=2, help="Maximum Miller index used when enumerating unique cubic surface normals.")
     poly_parser.add_argument("--azimuth-start-deg", type=float, default=0.0, help="Starting in-plane azimuth angle for each normal.")
     poly_parser.add_argument("--azimuth-stop-deg", type=float, default=180.0, help="Final in-plane azimuth angle for each normal.")
