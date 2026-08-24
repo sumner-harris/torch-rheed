@@ -1,3 +1,0 @@
-nb_001: textual_match=True max_abs_diff=0.000000e+00
-nb_003: textual_match=True max_abs_diff=0.000000e+00
-nb_005: textual_match=True max_abs_diff=0.000000e+00

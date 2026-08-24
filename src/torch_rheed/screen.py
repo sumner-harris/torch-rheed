@@ -9,6 +9,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from .models import BulkSimulation, RockingCurveBatchResult, RockingCurveResult, ScreenImageConfig
@@ -342,6 +343,57 @@ def _rod_profile(delta_q_parallel: torch.Tensor, *, correlation_length_angstrom:
     raise ValueError(f"unsupported rod profile: {profile}")
 
 
+def _gaussian_kernel_1d(
+    sigma_pixels: float,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    truncate: float = 4.0,
+) -> torch.Tensor:
+    """Return a normalized one-dimensional Gaussian convolution kernel."""
+
+    radius = max(1, math.ceil(truncate * sigma_pixels))
+    coordinates = torch.arange(-radius, radius + 1, dtype=dtype, device=device)
+    kernel = torch.exp(-0.5 * (coordinates / sigma_pixels).square())
+    return kernel / torch.sum(kernel)
+
+
+def _apply_instrument_broadening(
+    screen_stack: torch.Tensor,
+    *,
+    fwhm_mm: float,
+    screen_width_mm: float,
+    screen_height_mm: float,
+) -> torch.Tensor:
+    """Apply an isotropic physical-space Gaussian PSF to a ``(B,N,H,W)`` stack."""
+
+    if fwhm_mm <= 0.0:
+        return screen_stack
+
+    _, _, pixels_y, pixels_x = screen_stack.shape
+    sigma_mm = fwhm_mm / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+    sigma_x_pixels = sigma_mm / (screen_width_mm / pixels_x)
+    sigma_y_pixels = sigma_mm / (screen_height_mm / pixels_y)
+    flattened = screen_stack.reshape(-1, 1, pixels_y, pixels_x)
+
+    kernel_x = _gaussian_kernel_1d(
+        sigma_x_pixels,
+        dtype=screen_stack.dtype,
+        device=screen_stack.device,
+    )
+    radius_x = kernel_x.numel() // 2
+    broadened = F.conv2d(flattened, kernel_x.reshape(1, 1, 1, -1), padding=(0, radius_x))
+
+    kernel_y = _gaussian_kernel_1d(
+        sigma_y_pixels,
+        dtype=screen_stack.dtype,
+        device=screen_stack.device,
+    )
+    radius_y = kernel_y.numel() // 2
+    broadened = F.conv2d(broadened, kernel_y.reshape(1, 1, -1, 1), padding=(radius_y, 0))
+    return broadened.reshape_as(screen_stack)
+
+
 def _render_screen_stack_ctr(
     bulk: BulkSimulation,
     beam_indices: list[tuple[int, int]],
@@ -443,6 +495,14 @@ def _render_screen_stack_ctr(
 
     visibility = _sample_surface_visibility_mask(scattered_kz).to(dtype=image_dtype)
     screen_stack = screen_stack * visibility[None, None, :, :]
+    screen_stack = _apply_instrument_broadening(
+        screen_stack,
+        fwhm_mm=config.instrument_broadening_fwhm_mm,
+        screen_width_mm=config.screen_width_mm,
+        screen_height_mm=config.screen_height_mm,
+    )
+    # Preserve the requested hard substrate mask after the detector PSF is applied.
+    screen_stack = screen_stack * visibility[None, None, :, :]
 
     return screen_stack, ScreenImageConfig(
         plane_mode=config.plane_mode,
@@ -454,6 +514,7 @@ def _render_screen_stack_ctr(
         correlation_length_angstrom=config.correlation_length_angstrom,
         rod_profile=config.rod_profile,
         beam_intensity_floor=config.beam_intensity_floor,
+        instrument_broadening_fwhm_mm=config.instrument_broadening_fwhm_mm,
         source_glancing_divergence_fwhm_deg=config.source_glancing_divergence_fwhm_deg,
         source_divergence_samples=config.source_divergence_samples,
         reference_angle_deg=reference_angle_deg,
@@ -492,6 +553,8 @@ def render_screen_stack(
         raise ValueError(f"unsupported detector plane mode: {resolved_config.plane_mode}")
     if resolved_config.source_glancing_divergence_fwhm_deg < 0.0:
         raise ValueError("source_glancing_divergence_fwhm_deg must be non-negative")
+    if resolved_config.instrument_broadening_fwhm_mm < 0.0:
+        raise ValueError("instrument_broadening_fwhm_mm must be non-negative")
     if resolved_config.source_divergence_samples < 1:
         raise ValueError("source_divergence_samples must be at least 1")
     return _render_screen_stack_ctr(
@@ -547,6 +610,7 @@ def _render_screen_frame_image(
     angle_deg: float,
     title: str | None,
     default_prefix: str,
+    laue_circle_radius_mm: float | None = None,
 ) -> Image.Image:
     """Render one scaled CTR detector frame as an RGB image suitable for GIF export."""
 
@@ -570,6 +634,18 @@ def _render_screen_frame_image(
         alpha=0.9,
         zorder=4,
     )
+    if laue_circle_radius_mm is not None:
+        laue_circle = plt.Circle(
+            (0.0, 0.0),
+            laue_circle_radius_mm,
+            fill=False,
+            edgecolor="lime",
+            linewidth=1.25,
+            linestyle=(0, (3, 3)),
+            alpha=0.9,
+            zorder=4,
+        )
+        ax.add_patch(laue_circle)
     direct_x_mm, direct_y_mm = _direct_beam_detector_coordinates(config, angle_deg)
     if math.isfinite(direct_x_mm) and math.isfinite(direct_y_mm):
         ax.scatter(

@@ -218,6 +218,12 @@ def _add_common_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         help="Clip beam intensities below this value before building the CTR I(qz) profiles.",
     )
     parser.add_argument(
+        "--instrument-broadening-fwhm-mm",
+        type=float,
+        default=0.0,
+        help="Gaussian instrument-broadening FWHM on the detector in millimeters.",
+    )
+    parser.add_argument(
         "--source-glancing-divergence-fwhm-deg",
         type=float,
         default=0.0,
@@ -279,6 +285,7 @@ def _screen_config_from_args(args: argparse.Namespace) -> ScreenImageConfig:
         correlation_length_angstrom=args.correlation_length_angstrom,
         rod_profile=args.rod_profile,
         beam_intensity_floor=args.beam_intensity_floor,
+        instrument_broadening_fwhm_mm=args.instrument_broadening_fwhm_mm,
         source_glancing_divergence_fwhm_deg=args.source_glancing_divergence_fwhm_deg,
         source_divergence_samples=args.source_divergence_samples,
         reference_angle_deg=args.screen_reference_angle_deg,
@@ -779,6 +786,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Clip beam intensities below this value before building the CTR I(qz) profiles.",
+    )
+    poly_parser.add_argument(
+        "--instrument-broadening-fwhm-mm",
+        type=float,
+        default=0.0,
+        help="Gaussian instrument-broadening FWHM on the detector in millimeters.",
+    )
+    poly_parser.set_defaults(
+        source_glancing_divergence_fwhm_deg=0.0,
+        source_divergence_samples=9,
     )
     poly_parser.add_argument("--screen-reference-angle-deg", type=float, help="Optional detector-centering angle in degrees. Defaults to the 00 peak.")
     poly_parser.add_argument(

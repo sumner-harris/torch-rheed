@@ -24,18 +24,27 @@ def plot_rocking_curve(
     output_path: Path,
     *,
     title: str | None = None,
+    beam_indices: list[tuple[int, int]] | None = None,
 ) -> None:
-    """Plot all rocking-curve beams from a `RockingCurveResult`."""
+    """Plot selected rocking-curve beams, or all beams when not specified."""
+
+    selected_beams = result.beam_indices if beam_indices is None else beam_indices
+    if not selected_beams:
+        raise ValueError("beam_indices must contain at least one beam")
+    missing = [beam for beam in selected_beams if beam not in result.beam_indices]
+    if missing:
+        raise ValueError(f"requested plot beams are absent from the result: {missing}")
 
     fig, ax = plt.subplots(figsize=(9, 5.5), constrained_layout=True)
-    colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(result.beam_indices), 3)))
+    colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(selected_beams), 3)))
     angles_deg = _cpu_tensor(result.angles_deg)
     intensities = _cpu_tensor(result.intensities)
-    for idx, (ih, ik) in enumerate(result.beam_indices):
+    for color_index, (ih, ik) in enumerate(selected_beams):
+        result_index = result.beam_indices.index((ih, ik))
         ax.plot(
             angles_deg.tolist(),
-            intensities[:, idx].tolist(),
-            color=colors[idx % len(colors)],
+            intensities[:, result_index].tolist(),
+            color=colors[color_index % len(colors)],
             linewidth=2.0,
             label=f"{ih} {ik}",
         )
@@ -44,7 +53,7 @@ def plot_rocking_curve(
     ax.set_ylabel("Intensity")
     ax.set_title(title or "RHEED rocking curve")
     ax.grid(True, alpha=0.25)
-    ax.legend(ncol=min(3, max(1, len(result.beam_indices))), fontsize=9)
+    ax.legend(ncol=min(3, len(selected_beams)), fontsize=9)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
     plt.close(fig)

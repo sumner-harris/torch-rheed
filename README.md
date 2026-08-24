@@ -96,7 +96,7 @@ torch-rheed simulate `
   --screen-height-mm 100 `
   --screen-pixels-x 512 `
   --screen-pixels-y 384 `
-  --spot-sigma-mm 0.5 `
+  --instrument-broadening-fwhm-mm 1.4634 `
   --plane-mode vertical
 ```
 
@@ -194,6 +194,7 @@ result = simulate_from_files(
         screen_distance_mm=200.0,
         pixels_x=512,
         pixels_y=384,
+        instrument_broadening_fwhm_mm=1.4634,
     ),
 )
 result.write_surface_output(Path(r"C:\path\to\surf-bulkE.s"))

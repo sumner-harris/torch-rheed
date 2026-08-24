@@ -269,6 +269,7 @@ class ScreenImageConfig:
     correlation_length_angstrom: float = 1000.0
     rod_profile: str = "lorentzian"
     beam_intensity_floor: float = 0.0
+    instrument_broadening_fwhm_mm: float = 0.0
     source_glancing_divergence_fwhm_deg: float = 0.0
     source_divergence_samples: int = 9
     reference_angle_deg: float | None = None
