@@ -93,7 +93,7 @@ def _detector_frame(
     plane_mode: str,
     distance_mm: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Construct the detector center and orthonormal basis."""
+    """Construct the detector's sample-plane origin and orthonormal basis."""
 
     up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64, device=specular_direction.device)
 
@@ -105,10 +105,8 @@ def _detector_frame(
         )
         normal = _normalize(horizontal)
         right = _normalize(torch.linalg.cross(up, normal))
-        plane_anchor = normal * distance_mm
-        scale = float(torch.dot(plane_anchor, normal).item() / torch.dot(specular_direction, normal).item())
-        center = specular_direction * scale
-        return center, normal, right, up
+        origin = normal * distance_mm
+        return origin, normal, right, up
 
     normal = _normalize(specular_direction)
     right = torch.linalg.cross(up, normal)
@@ -116,8 +114,54 @@ def _detector_frame(
         right = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64, device=specular_direction.device)
     right = _normalize(right)
     up_axis = _normalize(torch.linalg.cross(normal, right))
-    center = normal * distance_mm
-    return center, normal, right, up_axis
+    plane_anchor = normal * distance_mm
+    surface_direction = torch.tensor(
+        [float(specular_direction[0].item()), float(specular_direction[1].item()), 0.0],
+        dtype=torch.float64,
+        device=specular_direction.device,
+    )
+    surface_direction = _normalize(surface_direction)
+    scale = float(torch.dot(plane_anchor, normal).item() / torch.dot(surface_direction, normal).item())
+    origin = surface_direction * scale
+    return origin, normal, right, up_axis
+
+
+def _direct_beam_detector_coordinates(
+    config: ScreenImageConfig,
+    glancing_deg: float,
+) -> tuple[float, float]:
+    """Return the direct-beam intersection in sample-surface detector coordinates."""
+
+    reference_deg = glancing_deg if config.reference_angle_deg is None else config.reference_angle_deg
+    reference_rad = math.radians(reference_deg)
+    specular_direction = torch.tensor(
+        [math.cos(reference_rad), 0.0, math.sin(reference_rad)],
+        dtype=torch.float64,
+    )
+    origin, normal, right, up = _detector_frame(
+        specular_direction,
+        plane_mode=config.plane_mode,
+        distance_mm=config.screen_distance_mm,
+    )
+
+    glancing_rad = math.radians(glancing_deg)
+    direct_direction = torch.tensor(
+        [math.cos(glancing_rad), 0.0, -math.sin(glancing_rad)],
+        dtype=torch.float64,
+    )
+    denominator = float(torch.dot(direct_direction, normal).item())
+    if abs(denominator) < 1.0e-12:
+        return float("nan"), float("nan")
+    distance_along_ray = float(torch.dot(origin, normal).item()) / denominator
+    intersection = direct_direction * distance_along_ray
+    relative = intersection - origin
+    return float(torch.dot(relative, right).item()), float(torch.dot(relative, up).item())
+
+
+def _sample_surface_visibility_mask(scattered_kz: torch.Tensor) -> torch.Tensor:
+    """Return the vacuum-side detector pixels not occluded by the substrate."""
+
+    return scattered_kz >= 0.0
 
 
 def _reference_angle(config: ScreenImageConfig, beam_indices: list[tuple[int, int]], angles_deg: torch.Tensor, intensities: torch.Tensor) -> float:
@@ -145,7 +189,7 @@ def _incident_wavevector_lab(wn: float, glancing_deg: float, *, device: torch.de
 
 def _build_detector_scattered_k_grid(
     *,
-    center: torch.Tensor,
+    origin: torch.Tensor,
     right: torch.Tensor,
     up: torch.Tensor,
     width_mm: float,
@@ -161,18 +205,18 @@ def _build_detector_scattered_k_grid(
         0.5 * width_mm - 0.5 * width_mm / pixels_x,
         pixels_x,
         dtype=torch.float64,
-        device=center.device,
+        device=origin.device,
     )
     y_centers_mm = torch.linspace(
         0.5 * height_mm - 0.5 * height_mm / pixels_y,
         -0.5 * height_mm + 0.5 * height_mm / pixels_y,
         pixels_y,
         dtype=torch.float64,
-        device=center.device,
+        device=origin.device,
     )
     y_grid_mm, x_grid_mm = torch.meshgrid(y_centers_mm, x_centers_mm, indexing="ij")
     detector_points = (
-        center[None, None, :]
+        origin[None, None, :]
         + x_grid_mm[:, :, None] * right[None, None, :]
         + y_grid_mm[:, :, None] * up[None, None, :]
     )
@@ -324,13 +368,13 @@ def _render_screen_stack_ctr(
     if specular_direction is None:
         raise ValueError(f"00 beam is non-propagating at detector reference angle {reference_angle_deg:.6f} deg")
 
-    center, normal, right, up = _detector_frame(
+    origin, normal, right, up = _detector_frame(
         specular_direction,
         plane_mode=config.plane_mode,
         distance_mm=config.screen_distance_mm,
     )
     scattered_kx, scattered_ky, scattered_kz = _build_detector_scattered_k_grid(
-        center=center,
+        origin=origin,
         right=right,
         up=up,
         width_mm=config.screen_width_mm,
@@ -396,6 +440,9 @@ def _render_screen_stack_ctr(
                     * intensity_along_rod
                     * rod_cross_section[None, :, :]
                 )
+
+    visibility = _sample_surface_visibility_mask(scattered_kz).to(dtype=image_dtype)
+    screen_stack = screen_stack * visibility[None, None, :, :]
 
     return screen_stack, ScreenImageConfig(
         plane_mode=config.plane_mode,
@@ -515,6 +562,37 @@ def _render_screen_frame_image(
         extent=_screen_extent(config),
         aspect="equal",
     )
+    ax.axhline(
+        0.0,
+        color="white",
+        linewidth=1.25,
+        linestyle=(0, (6, 4)),
+        alpha=0.9,
+        zorder=4,
+    )
+    direct_x_mm, direct_y_mm = _direct_beam_detector_coordinates(config, angle_deg)
+    if math.isfinite(direct_x_mm) and math.isfinite(direct_y_mm):
+        ax.scatter(
+            [direct_x_mm],
+            [direct_y_mm],
+            marker="x",
+            s=80,
+            linewidths=2.0,
+            color="cyan",
+            zorder=5,
+            label="Direct beam",
+        )
+        ax.annotate(
+            "direct beam",
+            xy=(direct_x_mm, direct_y_mm),
+            xytext=(7, -9),
+            textcoords="offset points",
+            color="cyan",
+            fontsize=8,
+            ha="left",
+            va="top",
+            zorder=5,
+        )
     ax.set_xlabel("Detector horizontal (mm)")
     ax.set_ylabel("Detector vertical (mm)")
     ax.set_title(_frame_title(angle_deg, default_prefix, title))
