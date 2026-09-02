@@ -258,7 +258,7 @@ class BulkSimulation:
 
 @dataclass(frozen=True)
 class ScreenImageConfig:
-    """Detector geometry and CTR rasterization settings for synthetic RHEED screens."""
+    """Detector geometry and beam-spot rasterization settings for synthetic RHEED screens."""
 
     plane_mode: str = "vertical"
     screen_distance_mm: float = 300.0

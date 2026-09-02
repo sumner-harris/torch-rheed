@@ -176,18 +176,6 @@ def _reference_angle(config: ScreenImageConfig, beam_indices: list[tuple[int, in
     return float(angles_deg[peak_index].item())
 
 
-def _incident_wavevector_lab(wn: float, glancing_deg: float, *, device: torch.device) -> torch.Tensor:
-    """Return the lab-frame incident wavevector for one glancing angle."""
-
-    ga = math.radians(glancing_deg)
-    cos_ga = math.cos(ga)
-    return torch.tensor(
-        [wn * cos_ga, 0.0, -wn * math.sin(ga)],
-        dtype=torch.float64,
-        device=device,
-    )
-
-
 def _build_detector_scattered_k_grid(
     *,
     origin: torch.Tensor,
@@ -224,55 +212,6 @@ def _build_detector_scattered_k_grid(
     directions = detector_points / torch.linalg.norm(detector_points, dim=2, keepdim=True)
     scattered_k = wn * directions
     return scattered_k[:, :, 0], scattered_k[:, :, 1], scattered_k[:, :, 2]
-
-
-def _beam_qz_profile(
-    bulk: BulkSimulation,
-    *,
-    azimuth_deg: float,
-    angles_deg: torch.Tensor,
-    beam_intensities: torch.Tensor,
-    ih: int,
-    ik: int,
-    intensity_floor: float,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return the shared ``q_z`` axis and batched intensities for one CTR rod."""
-
-    qz_values: list[torch.Tensor] = []
-    intensity_columns: list[torch.Tensor] = []
-
-    for angle_index in range(angles_deg.numel()):
-        intensity_column = beam_intensities[:, angle_index]
-        if float(torch.max(intensity_column).item()) <= intensity_floor:
-            continue
-        angle_deg = float(angles_deg[angle_index].item())
-        direction = _beam_direction(
-            bulk,
-            azimuth_deg=azimuth_deg,
-            glancing_deg=angle_deg,
-            ih=ih,
-            ik=ik,
-        )
-        if direction is None:
-            continue
-        qz_value = bulk.wn * direction[2] + bulk.wn * math.sin(math.radians(angle_deg))
-        qz_values.append(qz_value.to(dtype=torch.float64))
-        intensity_columns.append(intensity_column)
-
-    if len(qz_values) < 2:
-        return None
-
-    qz_tensor = torch.stack(qz_values, dim=0)
-    intensity_tensor = torch.stack(intensity_columns, dim=1)
-    qz_sorted, order = torch.sort(qz_tensor)
-    intensity_sorted = intensity_tensor.index_select(1, order)
-    keep = torch.ones_like(qz_sorted, dtype=torch.bool)
-    keep[1:] = qz_sorted[1:] != qz_sorted[:-1]
-    qz_unique = qz_sorted[keep]
-    intensity_unique = intensity_sorted[:, keep]
-    if qz_unique.numel() < 2:
-        return None
-    return qz_unique, intensity_unique
 
 
 def _interp1d_batch(query: torch.Tensor, axis: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -331,10 +270,10 @@ def _source_divergence_quadrature(config: ScreenImageConfig, *, device: torch.de
     return offsets_deg, weights
 
 
-def _rod_profile(delta_q_parallel: torch.Tensor, *, correlation_length_angstrom: float, profile: str) -> torch.Tensor:
-    """Return the reciprocal-space truncation-rod cross-section for one beam."""
+def _spot_profile(delta_q: torch.Tensor, *, correlation_length_angstrom: float, profile: str) -> torch.Tensor:
+    """Return a beam-centered reciprocal-space spot profile."""
 
-    scaled = delta_q_parallel * correlation_length_angstrom
+    scaled = delta_q * correlation_length_angstrom
     if profile == "lorentzian":
         return 1.0 / (1.0 + scaled.square())
     if profile == "lorentzian2":
@@ -394,7 +333,7 @@ def _apply_instrument_broadening(
     return broadened.reshape_as(screen_stack)
 
 
-def _render_screen_stack_ctr(
+def _render_screen_stack_beams(
     bulk: BulkSimulation,
     beam_indices: list[tuple[int, int]],
     angles_deg: torch.Tensor,
@@ -402,10 +341,10 @@ def _render_screen_stack_ctr(
     *,
     config: ScreenImageConfig,
 ) -> tuple[torch.Tensor, ScreenImageConfig]:
-    """Render the fixed-angle CTR/coherence-length detector-image stack."""
+    """Render beam intensities at their fixed-angle kinematic detector positions."""
 
     if config.correlation_length_angstrom <= 0.0:
-        raise ValueError("correlation_length_angstrom must be positive for CTR screen rendering")
+        raise ValueError("correlation_length_angstrom must be positive for screen rendering")
 
     azimuth_deg = bulk.source.azi_deg
     frame_azimuth_deg = azimuth_deg if config.frame_azimuth_deg is None else config.frame_azimuth_deg
@@ -435,20 +374,6 @@ def _render_screen_stack_ctr(
         pixels_y=config.pixels_y,
         wn=bulk.wn,
     )
-    ghx, ghy, gky = _reciprocal_steps(bulk)
-    qz_profiles = [
-        _beam_qz_profile(
-            bulk,
-            azimuth_deg=azimuth_deg,
-            angles_deg=angles_deg,
-            beam_intensities=intensities[:, :, beam_index],
-            ih=ih,
-            ik=ik,
-            intensity_floor=config.beam_intensity_floor,
-        )
-        for beam_index, (ih, ik) in enumerate(beam_indices)
-    ]
-
     batch_size, n_angles, _ = intensities.shape
     image_dtype = torch.float32
     screen_stack = torch.zeros(
@@ -461,36 +386,47 @@ def _render_screen_stack_ctr(
     for angle_index in range(n_angles):
         angle_deg = float(angles_deg[angle_index].item())
         for divergence_offset_deg, divergence_weight in zip(divergence_offsets_deg, divergence_weights, strict=True):
-            sample_angle_deg = angle_deg + float(divergence_offset_deg.item())
-            incident_k = _incident_wavevector_lab(bulk.wn, sample_angle_deg, device=bulk.device)
-            qx_grid = scattered_kx - incident_k[0]
-            qy_grid = scattered_ky - incident_k[1]
-            qz_grid = scattered_kz - incident_k[2]
+            divergence_offset = float(divergence_offset_deg.item())
+            sample_angle_deg = angle_deg + divergence_offset
 
             for beam_index, (ih, ik) in enumerate(beam_indices):
-                profile = qz_profiles[beam_index]
-                if profile is None:
-                    continue
-                qz_axis, intensity_axis = profile
-                rod_center = _rotate_lab_frame(
-                    torch.tensor(
-                        [ghx * ih, ghy * ih + gky * ik, 0.0],
-                        dtype=torch.float64,
-                        device=bulk.device,
-                    ),
-                    azimuth_deg,
+                direction = _beam_direction(
+                    bulk,
+                    azimuth_deg=azimuth_deg,
+                    glancing_deg=sample_angle_deg,
+                    ih=ih,
+                    ik=ik,
                 )
-                delta_q_parallel = torch.sqrt((qx_grid - rod_center[0]).square() + (qy_grid - rod_center[1]).square())
-                rod_cross_section = _rod_profile(
-                    delta_q_parallel,
+                if direction is None:
+                    continue
+
+                if divergence_offset == 0.0 or angles_deg.numel() == 1:
+                    beam_intensity = intensities[:, angle_index, beam_index]
+                else:
+                    angle_query = torch.tensor(sample_angle_deg, dtype=angles_deg.dtype, device=angles_deg.device)
+                    beam_intensity = _interp1d_batch(
+                        angle_query,
+                        angles_deg,
+                        intensities[:, :, beam_index],
+                    )
+                if float(torch.max(beam_intensity).item()) <= config.beam_intensity_floor:
+                    continue
+
+                center_k = bulk.wn * direction
+                delta_q = torch.sqrt(
+                    (scattered_kx - center_k[0]).square()
+                    + (scattered_ky - center_k[1]).square()
+                    + (scattered_kz - center_k[2]).square()
+                )
+                spot = _spot_profile(
+                    delta_q,
                     correlation_length_angstrom=config.correlation_length_angstrom,
                     profile=config.rod_profile,
                 ).to(dtype=image_dtype)
-                intensity_along_rod = _interp1d_batch(qz_grid, qz_axis, intensity_axis).to(dtype=image_dtype)
                 screen_stack[:, angle_index, :, :] += (
                     float(divergence_weight.item())
-                    * intensity_along_rod
-                    * rod_cross_section[None, :, :]
+                    * beam_intensity.to(dtype=image_dtype)[:, None, None]
+                    * spot[None, :, :]
                 )
 
     visibility = _sample_surface_visibility_mask(scattered_kz).to(dtype=image_dtype)
@@ -532,7 +468,7 @@ def render_screen_stack(
     *,
     config: ScreenImageConfig | None = None,
 ) -> tuple[torch.Tensor, ScreenImageConfig]:
-    """Render a batched CTR detector-image stack shaped ``(B,N,H,W)``."""
+    """Render a batched detector-image stack shaped ``(B,N,H,W)``."""
 
     if bulk.naz != 1:
         raise NotImplementedError("screen-image generation currently requires naz=1 so each frame is a glancing-angle sweep at fixed azimuth")
@@ -540,12 +476,6 @@ def render_screen_stack(
         raise ValueError(f"expected batched intensities shaped (B,N,NB), got {tuple(intensities.shape)}")
     if intensities.shape[1] != angles_deg.numel():
         raise ValueError("screen rendering requires one intensity row per glancing-angle sample")
-    if angles_deg.numel() < 2:
-        raise ValueError(
-            "CTR screen-image generation requires at least two glancing-angle samples; "
-            "use a local rocking-curve window even when you want one nominal detector frame"
-        )
-
     resolved_config = config or DEFAULT_SCREEN_IMAGE_CONFIG
     if resolved_config.pixels_x < 1 or resolved_config.pixels_y < 1:
         raise ValueError("screen-image pixel dimensions must both be positive")
@@ -557,7 +487,7 @@ def render_screen_stack(
         raise ValueError("instrument_broadening_fwhm_mm must be non-negative")
     if resolved_config.source_divergence_samples < 1:
         raise ValueError("source_divergence_samples must be at least 1")
-    return _render_screen_stack_ctr(
+    return _render_screen_stack_beams(
         bulk,
         beam_indices,
         angles_deg,
@@ -612,7 +542,7 @@ def _render_screen_frame_image(
     default_prefix: str,
     laue_circle_radius_mm: float | None = None,
 ) -> Image.Image:
-    """Render one scaled CTR detector frame as an RGB image suitable for GIF export."""
+    """Render one scaled detector frame as an RGB image suitable for GIF export."""
 
     figure_width = 8.0
     figure_height = max(4.5, figure_width * config.screen_height_mm / config.screen_width_mm)
@@ -711,7 +641,7 @@ def plot_screen_frame(
         config=config,
         angle_deg=angle_deg,
         title=title,
-        default_prefix="RHEED CTR screen",
+        default_prefix="RHEED screen",
     )
     try:
         image.save(output_path)
@@ -774,7 +704,7 @@ def write_screen_gif(
                 config=config,
                 angle_deg=angle_deg,
                 title=title,
-                default_prefix="RHEED CTR screen",
+                default_prefix="RHEED screen",
             )
         )
 

@@ -22,7 +22,7 @@ group.
 - Numerically stable scattering-matrix composition for evanescent beams
 - Single calculations and batched surface-structure calculations
 - Rocking-curve text, CSV, and plot outputs
-- Synthetic crystal-truncation-rod (CTR) detector images, previews, and GIFs
+- Synthetic detector images, previews, and GIFs with kinematic beam placement
 - Configurable source divergence and detector point-spread broadening
 - CIF/XYZ import, structure visualization, and CIF/XYZ export
 - Approximate polycrystalline screens from orientation averaging
@@ -135,11 +135,10 @@ measured intensity.
 
 ### 5. Synthetic detector images
 
-The optional detector renderer maps each calculated beam to its reciprocal-space
-crystal truncation rod and intersects those rods with a fixed detector plane.
-The rocking-curve intensity is interpolated along each rod; a Lorentzian or
-Gaussian transverse rod profile represents finite in-plane correlation
-length. The renderer can also apply:
+The optional detector renderer projects each calculated outgoing beam direction
+onto a fixed detector plane. Each frame uses only the beam intensities calculated
+at that frame's glancing angle; a Lorentzian beam-centered profile represents
+finite correlation length. The renderer can also apply:
 
 - Gaussian quadrature over glancing-angle source divergence;
 - an isotropic detector point-spread function specified by physical FWHM;
@@ -259,8 +258,7 @@ uv run torch-rheed simulate `
   --screen-gif-output data\detector_run\screen.gif
 ```
 
-Detector rendering currently requires a fixed azimuth scan and at least two
-glancing-angle samples.
+Detector rendering currently requires a fixed azimuth scan.
 
 ### Validate against a reference curve
 

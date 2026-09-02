@@ -133,7 +133,7 @@ def _write_requested_outputs(
     if screen_stack_output is not None:
         result.write_screen_stack(screen_stack_output)
     if screen_preview_output is not None:
-        plot_screen_frame(result, screen_preview_output, title=title or "Simulated RHEED CTR screen")
+        plot_screen_frame(result, screen_preview_output, title=title or "Simulated RHEED screen")
     if screen_gif_output is not None:
         write_screen_gif(
             result,
@@ -142,7 +142,7 @@ def _write_requested_outputs(
             frame_duration_ms=screen_gif_frame_duration_ms,
             normalize=screen_gif_normalize,
             boomerang=True,
-            title=title or "Simulated RHEED CTR screen",
+            title=title or "Simulated RHEED screen",
         )
 
 
@@ -203,19 +203,19 @@ def _add_common_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         "--correlation-length-angstrom",
         type=float,
         default=1000.0,
-        help="In-plane coherence/correlation length that sets the CTR rod width on the detector.",
+        help="Correlation length that sets the reciprocal-space beam-spot width on the detector.",
     )
     parser.add_argument(
         "--rod-profile",
         default="lorentzian",
         choices=("lorentzian", "lorentzian2"),
-        help="Reciprocal-space rod cross-section used by the CTR screen renderer.",
+        help="Reciprocal-space beam-spot profile used by the screen renderer.",
     )
     parser.add_argument(
         "--beam-intensity-floor",
         type=float,
         default=0.0,
-        help="Clip beam intensities below this value before building the CTR I(qz) profiles.",
+        help="Do not render beam intensities at or below this value.",
     )
     parser.add_argument(
         "--instrument-broadening-fwhm-mm",
@@ -229,7 +229,7 @@ def _add_common_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         default=0.0,
         help=(
             "Gaussian full width at half maximum, in degrees, for the incident-beam "
-            "glancing-angle divergence integrated into each CTR detector frame."
+            "glancing-angle divergence integrated into each detector frame."
         ),
     )
     parser.add_argument(
@@ -539,7 +539,7 @@ def _command_polycrystal(args: argparse.Namespace) -> int:
     if batch_stack_output is not None:
         result.write_orientation_screen_stack(batch_stack_output)
     if preview_output is not None:
-        plot_polycrystal_screen_frame(result, preview_output, title=args.title or "Polycrystalline RHEED CTR screen")
+        plot_polycrystal_screen_frame(result, preview_output, title=args.title or "Polycrystalline RHEED screen")
     if total_intensity_csv_output is not None:
         result.write_total_detector_csv(total_intensity_csv_output)
     if total_intensity_plot_output is not None:
@@ -773,19 +773,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--correlation-length-angstrom",
         type=float,
         default=1000.0,
-        help="In-plane coherence/correlation length that sets the CTR rod width on the detector.",
+        help="Correlation length that sets the reciprocal-space beam-spot width on the detector.",
     )
     poly_parser.add_argument(
         "--rod-profile",
         default="lorentzian",
         choices=("lorentzian", "lorentzian2"),
-        help="Reciprocal-space rod cross-section used by the CTR screen renderer.",
+        help="Reciprocal-space beam-spot profile used by the screen renderer.",
     )
     poly_parser.add_argument(
         "--beam-intensity-floor",
         type=float,
         default=0.0,
-        help="Clip beam intensities below this value before building the CTR I(qz) profiles.",
+        help="Do not render beam intensities at or below this value.",
     )
     poly_parser.add_argument(
         "--instrument-broadening-fwhm-mm",
